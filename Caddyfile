@@ -1,0 +1,182 @@
+# ═══════════════════════════════════════════════════════════
+# CADDYFILE - Reverse Proxy avec TLS automatique
+# ═══════════════════════════════════════════════════════════
+
+{
+    # Global options
+    admin off
+    http_port 80
+    https_port 443
+    auto_https off  # On gère manuellement pour les webhooks
+    
+    # Logging
+    log {
+        level INFO
+        format json
+        output file /data/logs/caddy.log {
+            roll_size 100MiB
+            roll_keep 5
+        }
+    }
+    
+    # Rate limiting (globale)
+    rate_limit {
+        zone static {
+            match {
+                path /static/*
+            }
+            rate 100MB
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════
+# DOMAINES
+# ═══════════════════════════════════════════════════════════
+
+api.tondomaine.com {
+    # TLS automatique via Let's Encrypt
+    tls {
+        protocols tls1.2 tls1.3
+        ciphers TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    }
+    
+    # Headers de sécurité
+    header {
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+        -X-Powered-By
+    }
+    
+    # CORS pour API
+    @cors {
+        header Origin *
+    }
+    handle @cors {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Content-Type, Authorization, X-Request-ID"
+        handle OPTIONS {
+            respond "" 204
+        }
+    }
+    
+    # Rate limiting par IP
+    @ratelimited {
+        remote_ip 60.60.60.60/24  # Blocklist
+    }
+    abort @ratelimited
+    
+    @highload {
+        path /telegram/webhook
+        not header X-Webhook-Secret *
+    }
+    respond @highload "Unauthorized" 401
+    
+    # Health checks (pas de rate limit)
+    @health {
+        path /health
+        path /ready
+    }
+    handle @health {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 5s
+                write_timeout 30s
+            }
+        }
+    }
+    
+    # Prometheus metrics (interne)
+    @metrics {
+        path /metrics
+    }
+    handle @metrics {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 5s
+                write_timeout 5s
+            }
+        }
+    }
+    
+    # Webhooks Telegram (fast, pas d'AI)
+    @telegram {
+        path /telegram/webhook
+    }
+    handle @telegram {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 10s
+                write_timeout 10s
+            }
+        }
+    }
+    
+    # Webhooks LemonSqueezy
+    @lemonsqueezy {
+        path /lemonsqueezy/webhook
+    }
+    handle @lemonsqueezy {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 10s
+                write_timeout 10s
+            }
+        }
+    }
+    
+    # API principale (avec rate limit)
+    @api {
+        path /api/*
+        path /export
+        path /delete
+        path /consents
+    }
+    handle @api {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 30s
+                write_timeout 60s
+            }
+           lb_try_duration 3s
+           lb_retry_match {
+                method GET
+            }
+        }
+    }
+    
+    # Admin dashboard
+    @admin {
+        path /admin/*
+    }
+    handle @admin {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 30s
+                write_timeout 30s
+            }
+        }
+    }
+    
+    # Default: API
+    handle {
+        reverse_proxy api:3000 {
+            transport http {
+                read_timeout 30s
+                write_timeout 30s
+            }
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════
+# REDIRECTIONS
+# ═══════════════════════════════════════════════════════════
+
+www.tondomaine.com {
+    redir https://api.tondomaine.com{uri} 301
+}

@@ -1,0 +1,277 @@
+version: '3.9'
+
+services:
+  # ═══════════════════════════════════════════════════════
+  # REVERSE PROXY - Caddy 2 (TLS automatique + Rate Limit)
+  # ═══════════════════════════════════════════════════════
+  caddy:
+    image: caddy:2-alpine
+    container_name: telegram-ai-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # ═══════════════════════════════════════════════════════
+  # API PRINCIPALE - Fastify + grammY
+  # ═══════════════════════════════════════════════════════
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: telegram-ai-api
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      # Database
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Redis
+      - REDIS_URL=redis://redis:6379
+      # Telegram
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET}
+      # LemonSqueezy (remplace Stripe)
+      - LEMON_API_KEY=${LEMON_API_KEY}
+      - LEMON_WEBHOOK_SECRET=${LEMON_WEBHOOK_SECRET}
+      - LEMON_STORE_ID=${LEMON_STORE_ID}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Secrets
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - SESSION_SECRET=${SESSION_SECRET}
+      - JWT_SECRET=${JWT_SECRET}
+      # Config
+      - APP_URL=https://${DOMAIN}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+    volumes:
+      - ./data/uploads:/app/uploads:rw
+      - ./data/logs:/app/logs:rw
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ═══════════════════════════════════════════════════════
+  # WORKER - Traitements IA (BullMQ)
+  # ═══════════════════════════════════════════════════════
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: telegram-ai-worker
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    volumes:
+      - ./data/uploads:/app/uploads:rw
+      - ./data/logs:/app/logs:rw
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # ═══════════════════════════════════════════════════════
+  # REDIS - Queue + Cache + Rate Limiting
+  # ═══════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: telegram-ai-redis
+    restart: unless-stopped
+    command: |
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --tcp-backlog 511
+      --timeout 0
+      --tcp-keepalive 300
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # ═══════════════════════════════════════════════════════
+  # POSTGRESQL - Base de données principale
+  # ═══════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: telegram-ai-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./data/backups:/backups:rw
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ═══════════════════════════════════════════════════════
+  # HOT STANDBY - Réplica PostgreSQL ( Disaster Recovery )
+  # ═══════════════════════════════════════════════════════
+  postgres-replica:
+    image: postgres:15-alpine
+    container_name: telegram-ai-postgres-replica
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_REPLICATION_MODE=replica
+      - POSTGRES_REPLICATION_USER=replicator
+      - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    depends_on:
+      - postgres
+    command: |
+      postgres
+      -c shared_buffers=256MB
+      -c max_connections=100
+      -c hot_standby=on
+      -c hot_standby_feedback=on
+      -c primary_conninfo=host=postgres port=5432 user=replicator password=${POSTGRES_REPLICATION_PASSWORD} application_name=replica
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ═══════════════════════════════════════════════════════
+  # S3/MINIO - Stockage backups et fichiers (optionnel)
+  # ═══════════════════════════════════════════════════════
+  minio:
+    image: minio/minio:latest
+    container_name: telegram-ai-minio
+    restart: unless-stopped
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - backend
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+# ═══════════════════════════════════════════════════════
+# VOLUMES
+# ═══════════════════════════════════════════════════════
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:
+  postgres_data:
+  postgres_replica_data:
+  minio_data:
+
+# ═══════════════════════════════════════════════════════
+# NETWORKS
+# ═══════════════════════════════════════════════════════
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
